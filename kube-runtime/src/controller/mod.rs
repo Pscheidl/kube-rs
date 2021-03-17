@@ -17,7 +17,9 @@ use futures::{
     stream::{self, SelectAll},
     FutureExt, SinkExt, Stream, StreamExt, TryFuture, TryFutureExt, TryStream, TryStreamExt,
 };
-use kube::api::{Api, ListParams, Meta};
+use k8s_openapi::serde_json::json;
+use k8s_openapi::serde_json::Value;
+use kube::api::{Api, ListParams, Meta, Patch, PatchParams};
 use serde::de::DeserializeOwned;
 use snafu::{futures::TryStreamExt as SnafuTryStreamExt, Backtrace, ResultExt, Snafu};
 use std::{fmt::Debug, sync::Arc, time::Duration};
@@ -144,9 +146,11 @@ pub fn applier<K, QueueStream, ReconcilerFut, T>(
     context: Context<T>,
     store: Store<K>,
     queue: QueueStream,
+    finalizer: Option<String>,
+    api: Api<K>,
 ) -> impl Stream<Item = Result<(ObjectRef<K>, ReconcilerAction), Error<ReconcilerFut::Error, QueueStream::Error>>>
 where
-    K: Clone + Meta + 'static,
+    K: Clone + Meta + 'static + DeserializeOwned + Debug,
     ReconcilerFut: TryFuture<Ok = ReconcilerAction> + Unpin,
     ReconcilerFut::Error: std::error::Error + 'static,
     QueueStream: TryStream<Ok = ObjectRef<K>>,
@@ -171,12 +175,32 @@ where
             Runner::new(scheduler(s), move |obj_ref| {
                 let obj_ref = obj_ref.clone();
                 match store.get(&obj_ref) {
-                    Some(obj) => reconciler(obj, context.clone())
-                        .into_future()
-                        // Reconciler errors are OK from the applier's PoV, we need to apply the error policy
-                        // to them separately
-                        .map(|res| Ok((obj_ref, res)))
-                        .left_future(),
+                    Some(obj) => {
+                        if finalizer.is_some() {
+                            let finalizer = finalizer.as_ref().unwrap();
+                            let finalizer_missing: bool = obj
+                                .meta()
+                                .finalizers
+                                .as_ref()
+                                .map_or(false, |finalizers| !finalizers.contains(finalizer));
+                            let finalizer: Value = json!({
+                                "metadata": {
+                                    "finalizers": [format!("\"{}\"", finalizer)],
+                                }
+                            });
+                            let finalizer_patch = Patch::Merge(finalizer);
+                            if finalizer_missing {
+                                api.patch(&obj.name(), &PatchParams::default(), &finalizer_patch)
+                                    .await;
+                            }
+                        }
+                        reconciler(obj, context.clone())
+                            .into_future()
+                            // Reconciler errors are OK from the applier's PoV, we need to apply the error policy
+                            // to them separately
+                            .map(|res| Ok((obj_ref, res)))
+                            .left_future()
+                    }
                     None => future::err(ObjectNotFound { obj_ref }.build()).right_future(),
                 }
             })
@@ -283,6 +307,8 @@ where
     // TODO: get an arbitrary std::error::Error in here?
     selector: SelectAll<BoxStream<'static, Result<ObjectRef<K>, watcher::Error>>>,
     reader: Store<K>,
+    owned_api: Api<K>,
+    finalizer: Option<String>,
 }
 
 impl<K> Controller<K>
@@ -298,10 +324,18 @@ where
         let writer = Writer::<K>::default();
         let reader = writer.as_reader();
         let mut selector = stream::SelectAll::new();
-        let self_watcher =
-            trigger_self(try_flatten_applied(reflector(writer, watcher(owned_api, lp)))).boxed();
+        let self_watcher = trigger_self(try_flatten_applied(reflector(
+            writer,
+            watcher(owned_api.clone(), lp),
+        )))
+        .boxed();
         selector.push(self_watcher);
-        Self { selector, reader }
+        Self {
+            selector,
+            reader,
+            owned_api,
+            finalizer: None,
+        }
     }
 
     /// Retrieve a copy of the reader before starting the controller
@@ -324,6 +358,11 @@ where
     ) -> Self {
         let child_watcher = trigger_owners(try_flatten_touched(watcher(api, lp)));
         self.selector.push(child_watcher.boxed());
+        self
+    }
+
+    pub fn finalizer(mut self, name: String) -> Self {
+        self.finalizer = Some(name);
         self
     }
 
@@ -371,6 +410,8 @@ where
             context,
             self.reader,
             self.selector,
+            self.finalizer,
+            self.owned_api.clone(),
         )
     }
 }
